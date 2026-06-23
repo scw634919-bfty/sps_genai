@@ -54,7 +54,7 @@ def get_embedding(request: EmbeddingRequest):
         "word": request.word,
         "has_vector": embedding_model.has_vector(request.word),
         "embedding_length": len(vector),
-        "embedding_preview": vector[:10]
+        "embedding": vector
     }
 
 
