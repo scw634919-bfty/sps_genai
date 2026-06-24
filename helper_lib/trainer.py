@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 from tqdm import tqdm
 
 from .checkpoints import save_checkpoint
@@ -112,5 +113,72 @@ def train_model(
                 accuracy=val_accuracy,
                 checkpoint_dir=f"{checkpoint_dir}/best",
             )
+
+    return model
+
+def vae_loss_function(reconstruction, inputs, mu, logvar):
+    reconstruction_loss = F.binary_cross_entropy(
+        reconstruction,
+        inputs,
+        reduction="sum",
+    )
+
+    kl_divergence = -0.5 * torch.sum(
+        1 + logvar - mu.pow(2) - logvar.exp()
+    )
+
+    return reconstruction_loss + kl_divergence
+
+
+def train_vae_model(
+    model,
+    data_loader,
+    criterion,
+    optimizer,
+    device="cpu",
+    epochs=10,
+):
+    model = model.to(device)
+    model.train()
+
+    for epoch in range(1, epochs + 1):
+        total_loss = 0.0
+
+        progress_bar = tqdm(
+            data_loader,
+            desc=f"Epoch {epoch}/{epochs}",
+        )
+
+        for images, _ in progress_bar:
+            images = images.to(device)
+
+            optimizer.zero_grad()
+
+            reconstruction, mu, logvar = model(images)
+
+            loss = criterion(
+                reconstruction,
+                images,
+                mu,
+                logvar,
+            )
+
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item()
+
+            progress_bar.set_postfix(
+                loss=f"{loss.item():.4f}"
+            )
+
+        average_loss = total_loss / len(data_loader.dataset)
+
+        print(
+            f"Epoch {epoch}/{epochs} | "
+            f"Average Loss: {average_loss:.4f}"
+        )
+
+    print("Finished VAE Training")
 
     return model
