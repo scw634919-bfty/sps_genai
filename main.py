@@ -1,7 +1,14 @@
-from fastapi import FastAPI
+import io
+
+import torch
+from fastapi import FastAPI, File, UploadFile
+from PIL import Image
 from pydantic import BaseModel
+from torchvision import transforms
+
 from app.bigram_model import BigramModel
 from app.embedding_model import EmbeddingModel
+from helper_lib.model import get_model
 
 app = FastAPI()
 
@@ -17,6 +24,35 @@ corpus = [
 bigram_model = BigramModel(corpus)
 embedding_model = EmbeddingModel()
 
+CLASS_NAMES = [
+    "airplane",
+    "automobile",
+    "bird",
+    "cat",
+    "deer",
+    "dog",
+    "frog",
+    "horse",
+    "ship",
+    "truck",
+]
+
+cnn_device = torch.device("cpu")
+cnn_model = get_model("AssignmentCNN")
+
+checkpoint = torch.load(
+    "checkpoints/assignment_cnn/best/model_epoch_001.pth",
+    map_location=cnn_device,
+)
+
+cnn_model.load_state_dict(checkpoint["model_state_dict"])
+cnn_model.to(cnn_device)
+cnn_model.eval()
+
+cnn_transform = transforms.Compose([
+    transforms.Resize((64, 64)),
+    transforms.ToTensor(),
+])
 
 class TextGenerationRequest(BaseModel):
     start_word: str
@@ -69,4 +105,41 @@ def get_similarity(request: SimilarityRequest):
         "word1": request.word1,
         "word2": request.word2,
         "similarity": similarity
+    }
+
+@app.post("/classify")
+async def classify_image(file: UploadFile = File(...)):
+    if not file.content_type or not file.content_type.startswith("image/"):
+        return {
+            "error": "Please upload a valid image file."
+        }
+
+    image_bytes = await file.read()
+
+    image = Image.open(
+        io.BytesIO(image_bytes)
+    ).convert("RGB")
+
+    image_tensor = (
+        cnn_transform(image)
+        .unsqueeze(0)
+        .to(cnn_device)
+    )
+
+    with torch.no_grad():
+        outputs = cnn_model(image_tensor)
+        probabilities = torch.softmax(outputs, dim=1)
+
+        confidence, predicted_index = torch.max(
+            probabilities,
+            dim=1,
+        )
+
+    class_index = predicted_index.item()
+
+    return {
+        "filename": file.filename,
+        "predicted_class": CLASS_NAMES[class_index],
+        "class_index": class_index,
+        "confidence": confidence.item(),
     }
