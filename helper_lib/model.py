@@ -216,6 +216,77 @@ class AssignmentCNN(nn.Module):
         x = self.classifier(x)
         return x
 
+class Critic(nn.Module):
+    def __init__(self):
+        super(Critic, self).__init__()
+
+        self.model = nn.Sequential(
+            nn.Conv2d(3, 64, kernel_size=4, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.LeakyReLU(0.2, inplace=True),
+
+            nn.Conv2d(64, 128, kernel_size=4, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.LeakyReLU(0.2, inplace=True),
+
+            nn.Conv2d(128, 256, kernel_size=4, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(256),
+            nn.LeakyReLU(0.2, inplace=True),
+
+            nn.Conv2d(256, 512, kernel_size=4, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(512),
+            nn.LeakyReLU(0.2, inplace=True),
+
+            nn.Conv2d(512, 1, kernel_size=4, stride=1, padding=0, bias=False),
+            nn.Flatten()
+        )
+
+    def forward(self, x):
+        return self.model(x)
+
+
+class Generator(nn.Module):
+    def __init__(self, z_dim=100):
+        super(Generator, self).__init__()
+
+        self.z_dim = z_dim
+
+        self.model = nn.Sequential(
+            nn.ConvTranspose2d(z_dim, 512, kernel_size=4, stride=1, padding=0, bias=False),
+            nn.BatchNorm2d(512, momentum=0.9),
+            nn.ReLU(True),
+
+            nn.ConvTranspose2d(512, 256, kernel_size=4, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(256, momentum=0.9),
+            nn.ReLU(True),
+
+            nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(128, momentum=0.9),
+            nn.ReLU(True),
+
+            nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(64, momentum=0.9),
+            nn.ReLU(True),
+
+            nn.ConvTranspose2d(64, 3, kernel_size=4, stride=2, padding=1),
+            nn.Tanh()
+        )
+
+    def forward(self, x):
+        if x.dim() == 2:
+            x = x.view(x.size(0), self.z_dim, 1, 1)
+        return self.model(x)
+
+
+class GAN(nn.Module):
+    def __init__(self, z_dim=100):
+        super(GAN, self).__init__()
+        self.generator = Generator(z_dim=z_dim)
+        self.critic = Critic()
+
+    def forward(self, z):
+        return self.generator(z)
+
 def get_model(model_name):
     if model_name == "FCNN":
         return FCNN()
@@ -232,7 +303,16 @@ def get_model(model_name):
     if model_name == "AssignmentCNN":
         return AssignmentCNN()
 
+    if model_name == "Generator":
+        return Generator()
+
+    if model_name == "Critic":
+        return Critic()
+
+    if model_name == "GAN":
+        return GAN()
+
     raise ValueError(
         "model_name must be 'FCNN', 'CNN', 'EnhancedCNN', "
-        "'VAE', or 'AssignmentCNN'"
+        "'VAE', 'AssignmentCNN', 'Generator', 'Critic', or 'GAN'"
     )
