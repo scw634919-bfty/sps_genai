@@ -287,6 +287,84 @@ class GAN(nn.Module):
     def forward(self, z):
         return self.generator(z)
 
+class MNISTGenerator(nn.Module):
+    def __init__(self, z_dim=100):
+        super(MNISTGenerator, self).__init__()
+
+        self.z_dim = z_dim
+
+        self.fc = nn.Linear(z_dim, 7 * 7 * 128)
+
+        self.model = nn.Sequential(
+            nn.ConvTranspose2d(
+                in_channels=128,
+                out_channels=64,
+                kernel_size=4,
+                stride=2,
+                padding=1
+            ),
+            nn.BatchNorm2d(64),
+            nn.ReLU(True),
+
+            nn.ConvTranspose2d(
+                in_channels=64,
+                out_channels=1,
+                kernel_size=4,
+                stride=2,
+                padding=1
+            ),
+            nn.Tanh()
+        )
+
+    def forward(self, z):
+        x = self.fc(z)
+        x = x.view(z.size(0), 128, 7, 7)
+        x = self.model(x)
+        return x
+
+
+class MNISTDiscriminator(nn.Module):
+    def __init__(self):
+        super(MNISTDiscriminator, self).__init__()
+
+        self.model = nn.Sequential(
+            nn.Conv2d(
+                in_channels=1,
+                out_channels=64,
+                kernel_size=4,
+                stride=2,
+                padding=1
+            ),
+            nn.LeakyReLU(0.2, inplace=True),
+
+            nn.Conv2d(
+                in_channels=64,
+                out_channels=128,
+                kernel_size=4,
+                stride=2,
+                padding=1
+            ),
+            nn.BatchNorm2d(128),
+            nn.LeakyReLU(0.2, inplace=True),
+
+            nn.Flatten(),
+            nn.Linear(128 * 7 * 7, 1)
+        )
+
+    def forward(self, x):
+        return self.model(x)
+
+
+class MNISTGAN(nn.Module):
+    def __init__(self, z_dim=100):
+        super(MNISTGAN, self).__init__()
+
+        self.generator = MNISTGenerator(z_dim=z_dim)
+        self.discriminator = MNISTDiscriminator()
+
+    def forward(self, z):
+        return self.generator(z)
+
 def get_model(model_name):
     if model_name == "FCNN":
         return FCNN()
@@ -312,7 +390,17 @@ def get_model(model_name):
     if model_name == "GAN":
         return GAN()
 
+    if model_name == "MNISTGenerator":
+        return MNISTGenerator()
+
+    if model_name == "MNISTDiscriminator":
+        return MNISTDiscriminator()
+
+    if model_name == "MNISTGAN":
+        return MNISTGAN()
+
     raise ValueError(
-        "model_name must be 'FCNN', 'CNN', 'EnhancedCNN', "
-        "'VAE', 'AssignmentCNN', 'Generator', 'Critic', or 'GAN'"
+    "model_name must be 'FCNN', 'CNN', 'EnhancedCNN', 'VAE', "
+    "'AssignmentCNN', 'Generator', 'Critic', 'GAN', "
+    "'MNISTGenerator', 'MNISTDiscriminator', or 'MNISTGAN'"
     )
