@@ -10,7 +10,7 @@ COPY pyproject.toml uv.lock .python-version ./
 
 RUN uv sync --frozen
 
-RUN uv run python -m spacy download en_core_web_lg
+# RUN uv run python -m spacy download en_core_web_lg
 
 COPY . .
 

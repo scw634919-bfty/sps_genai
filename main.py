@@ -1,7 +1,7 @@
 import io
 
 import torch
-from fastapi import FastAPI, File, UploadFile
+from fastapi import FastAPI, File, UploadFile, HTTPException
 from PIL import Image
 from pydantic import BaseModel
 from torchvision import transforms
@@ -22,7 +22,10 @@ corpus = [
 ]
 
 bigram_model = BigramModel(corpus)
-embedding_model = EmbeddingModel()
+try:
+    embedding_model = EmbeddingModel()
+except OSError:
+    embedding_model = None
 
 CLASS_NAMES = [
     "airplane",
@@ -54,6 +57,19 @@ cnn_transform = transforms.Compose([
     transforms.ToTensor(),
 ])
 
+# Assignment 3 MNIST GAN setup
+mnist_gan_device = torch.device("cpu")
+mnist_gan_model = get_model("MNISTGAN")
+
+mnist_gan_checkpoint = torch.load(
+    "checkpoints/assignment3_gan/mnist_gan.pth",
+    map_location=mnist_gan_device
+)
+
+mnist_gan_model.load_state_dict(mnist_gan_checkpoint["model_state_dict"])
+mnist_gan_model.to(mnist_gan_device)
+mnist_gan_model.eval()
+
 class TextGenerationRequest(BaseModel):
     start_word: str
     length: int
@@ -84,6 +100,12 @@ def generate_text(request: TextGenerationRequest):
 
 @app.post("/embedding")
 def get_embedding(request: EmbeddingRequest):
+    if embedding_model is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Embedding model is not available in this Docker environment."
+        )
+
     vector = embedding_model.get_embedding(request.word)
 
     return {
@@ -96,6 +118,12 @@ def get_embedding(request: EmbeddingRequest):
 
 @app.post("/similarity")
 def get_similarity(request: SimilarityRequest):
+    if embedding_model is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Embedding model is not available in this Docker environment."
+        )
+
     similarity = embedding_model.get_similarity(
         request.word1,
         request.word2
@@ -143,3 +171,29 @@ async def classify_image(file: UploadFile = File(...)):
         "class_index": class_index,
         "confidence": confidence.item(),
     }
+
+@app.get("/generate-digit")
+def generate_digit():
+    z_dim = 100
+
+    with torch.no_grad():
+        noise = torch.randn(1, z_dim, device=mnist_gan_device)
+        fake_image = mnist_gan_model.generator(noise)
+
+    # Convert from [-1, 1] to [0, 1]
+    fake_image = (fake_image + 1) / 2
+
+    # Shape: [1, 1, 28, 28] -> [28, 28]
+    image_array = fake_image.squeeze().cpu().numpy()
+
+    # Convert to PNG image
+    image_array = (image_array * 255).clip(0, 255).astype("uint8")
+    image = Image.fromarray(image_array, mode="L")
+
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    buffer.seek(0)
+
+    from fastapi.responses import StreamingResponse
+
+    return StreamingResponse(buffer, media_type="image/png")

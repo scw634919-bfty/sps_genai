@@ -262,3 +262,84 @@ def train_gan(
         )
 
     return model
+
+def train_mnist_gan(
+    model,
+    data_loader,
+    device="cpu",
+    epochs=5,
+    z_dim=100,
+    lr=0.0002,
+    beta1=0.5,
+):
+    import torch
+    import torch.nn as nn
+    import torch.optim as optim
+
+    model.to(device)
+
+    generator = model.generator
+    discriminator = model.discriminator
+
+    generator.train()
+    discriminator.train()
+
+    criterion = nn.BCEWithLogitsLoss()
+
+    optimizer_g = optim.Adam(generator.parameters(), lr=lr, betas=(beta1, 0.999))
+    optimizer_d = optim.Adam(discriminator.parameters(), lr=lr, betas=(beta1, 0.999))
+
+    for epoch in range(epochs):
+        total_g_loss = 0.0
+        total_d_loss = 0.0
+
+        for real_images, _ in data_loader:
+            real_images = real_images.to(device)
+            batch_size = real_images.size(0)
+
+            real_labels = torch.ones(batch_size, 1, device=device)
+            fake_labels = torch.zeros(batch_size, 1, device=device)
+
+            # Train Discriminator
+
+            optimizer_d.zero_grad()
+
+            real_outputs = discriminator(real_images)
+            real_loss = criterion(real_outputs, real_labels)
+
+            noise = torch.randn(batch_size, z_dim, device=device)
+            fake_images = generator(noise)
+
+            fake_outputs = discriminator(fake_images.detach())
+            fake_loss = criterion(fake_outputs, fake_labels)
+
+            d_loss = real_loss + fake_loss
+            d_loss.backward()
+            optimizer_d.step()
+
+            # Train Generator
+
+            optimizer_g.zero_grad()
+
+            noise = torch.randn(batch_size, z_dim, device=device)
+            fake_images = generator(noise)
+
+            fake_outputs = discriminator(fake_images)
+            g_loss = criterion(fake_outputs, real_labels)
+
+            g_loss.backward()
+            optimizer_g.step()
+
+            total_d_loss += d_loss.item()
+            total_g_loss += g_loss.item()
+
+        avg_d_loss = total_d_loss / len(data_loader)
+        avg_g_loss = total_g_loss / len(data_loader)
+
+        print(
+            f"Epoch [{epoch + 1}/{epochs}] "
+            f"Discriminator Loss: {avg_d_loss:.4f}, "
+            f"Generator Loss: {avg_g_loss:.4f}"
+        )
+
+    return model
