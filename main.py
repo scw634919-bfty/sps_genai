@@ -1,7 +1,9 @@
 import io
 
+import numpy as np
 import torch
 from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi.responses import StreamingResponse
 from PIL import Image
 from pydantic import BaseModel
 from torchvision import transforms
@@ -9,6 +11,7 @@ from torchvision import transforms
 from app.bigram_model import BigramModel
 from app.embedding_model import EmbeddingModel
 from helper_lib.model import get_model
+from helper_lib.generator import generate_energy_samples
 
 app = FastAPI()
 
@@ -40,6 +43,14 @@ CLASS_NAMES = [
     "truck",
 ]
 
+assignment4_device = (
+    "cuda"
+    if torch.cuda.is_available()
+    else "mps"
+    if torch.backends.mps.is_available()
+    else "cpu"
+)
+
 cnn_device = torch.device("cpu")
 cnn_model = get_model("AssignmentCNN")
 
@@ -69,6 +80,33 @@ mnist_gan_checkpoint = torch.load(
 mnist_gan_model.load_state_dict(mnist_gan_checkpoint["model_state_dict"])
 mnist_gan_model.to(mnist_gan_device)
 mnist_gan_model.eval()
+
+diffusion_model = get_model("Diffusion").to(assignment4_device)
+
+diffusion_checkpoint = torch.load(
+    "checkpoints/diffusion/diffusion_cifar10.pth",
+    map_location=assignment4_device,
+)
+
+diffusion_model.load_state_dict(
+    diffusion_checkpoint["model_state_dict"]
+)
+
+diffusion_model.eval()
+
+
+energy_model = get_model("Energy").to(assignment4_device)
+
+energy_checkpoint = torch.load(
+    "checkpoints/energy/energy_cifar10.pth",
+    map_location=assignment4_device,
+)
+
+energy_model.load_state_dict(
+    energy_checkpoint["model_state_dict"]
+)
+
+energy_model.eval()
 
 class TextGenerationRequest(BaseModel):
     start_word: str
@@ -197,3 +235,61 @@ def generate_digit():
     from fastapi.responses import StreamingResponse
 
     return StreamingResponse(buffer, media_type="image/png")
+
+def rgb_tensor_to_response(image_tensor):
+    image_tensor = image_tensor.detach().cpu()
+
+    if image_tensor.dim() == 4:
+        image_tensor = image_tensor[0]
+
+    image_array = (
+        image_tensor.permute(1, 2, 0)
+        .numpy()
+    )
+
+    image_array = (
+        image_array * 255
+    ).clip(0, 255).astype("uint8")
+
+    image = Image.fromarray(
+        image_array,
+        mode="RGB",
+    )
+
+    buffer = io.BytesIO()
+
+    image.save(buffer, format="PNG")
+
+    buffer.seek(0)
+
+    return StreamingResponse(
+        buffer,
+        media_type="image/png",
+    )
+
+@app.get("/generate-diffusion")
+def generate_diffusion():
+
+    with torch.no_grad():
+
+        images = diffusion_model.generate(
+            num_images=1,
+            diffusion_steps=20,
+            image_size=32,
+        )
+
+    return rgb_tensor_to_response(images[0])
+
+@app.get("/generate-energy")
+def generate_energy():
+
+    images = generate_energy_samples(
+        model=energy_model,
+        device=assignment4_device,
+        num_samples=1,
+        image_size=32,
+        sampling_steps=60,
+        save_path="api_energy.png",
+    )
+
+    return rgb_tensor_to_response(images[0])

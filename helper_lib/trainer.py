@@ -343,3 +343,152 @@ def train_mnist_gan(
         )
 
     return model
+
+def train_diffusion(
+    model,
+    data_loader,
+    criterion,
+    optimizer,
+    device="cpu",
+    epochs=10,
+):
+    model = model.to(device)
+
+    for epoch in range(1, epochs + 1):
+        total_loss = 0.0
+
+        progress_bar = tqdm(
+            data_loader,
+            desc=f"Epoch {epoch}/{epochs}",
+        )
+
+        for images, _ in progress_bar:
+            images = images.to(device)
+
+            loss = model.train_step(
+                images=images,
+                optimizer=optimizer,
+                loss_fn=criterion,
+            )
+
+            total_loss += loss
+
+            progress_bar.set_postfix(
+                loss=f"{loss:.4f}"
+            )
+
+        average_loss = total_loss / len(data_loader)
+
+        print(
+            f"Epoch {epoch}/{epochs} | "
+            f"Average Diffusion Loss: {average_loss:.4f}"
+        )
+
+    print("Finished Diffusion Training")
+
+    return model
+
+def train_energy_model(
+    model,
+    data_loader,
+    optimizer,
+    device="cpu",
+    epochs=1,
+    sampling_steps=20,
+    step_size=10.0,
+    noise_scale=0.005,
+    regularization_weight=0.1,
+):
+    model = model.to(device)
+
+    for epoch in range(1, epochs + 1):
+        model.train()
+        total_loss = 0.0
+
+        progress_bar = tqdm(
+            data_loader,
+            desc=f"Epoch {epoch}/{epochs}",
+        )
+
+        for real_images, _ in progress_bar:
+            real_images = real_images.to(device)
+
+            negative_images = torch.rand_like(
+                real_images,
+                device=device,
+            )
+
+            for _ in range(sampling_steps):
+                negative_images = negative_images.detach()
+                negative_images.requires_grad_(True)
+
+                noise = (
+                    torch.randn_like(negative_images)
+                    * noise_scale
+                )
+
+                negative_energy = model(
+                    negative_images
+                ).sum()
+
+                image_gradients = torch.autograd.grad(
+                    outputs=negative_energy,
+                    inputs=negative_images,
+                    create_graph=False,
+                )[0]
+
+                negative_images = (
+                    negative_images
+                    - step_size * image_gradients
+                    + noise
+                )
+
+                negative_images = torch.clamp(
+                    negative_images,
+                    min=0.0,
+                    max=1.0,
+                )
+
+            negative_images = negative_images.detach()
+
+            real_energy = model(real_images)
+            negative_energy = model(negative_images)
+
+            contrastive_loss = (
+                real_energy.mean()
+                - negative_energy.mean()
+            )
+
+            regularization_loss = (
+                real_energy.pow(2).mean()
+                + negative_energy.pow(2).mean()
+            )
+
+            loss = (
+                contrastive_loss
+                + regularization_weight
+                * regularization_loss
+            )
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item()
+
+            progress_bar.set_postfix(
+                loss=f"{loss.item():.4f}",
+                real=f"{real_energy.mean().item():.4f}",
+                fake=f"{negative_energy.mean().item():.4f}",
+            )
+
+        average_loss = total_loss / len(data_loader)
+
+        print(
+            f"Epoch {epoch}/{epochs} | "
+            f"Average Energy Loss: {average_loss:.4f}"
+        )
+
+    print("Finished Energy Model Training")
+
+    return model
