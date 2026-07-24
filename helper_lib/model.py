@@ -1,7 +1,12 @@
+import copy
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+def swish(x):
+    return x * torch.sigmoid(x)
 
 class FCNN(nn.Module):
     def __init__(self):
@@ -365,6 +370,693 @@ class MNISTGAN(nn.Module):
     def forward(self, z):
         return self.generator(z)
 
+def linear_diffusion_schedule(
+    diffusion_times,
+    min_rate=1e-4,
+    max_rate=0.02,
+):
+    diffusion_times = diffusion_times.to(dtype=torch.float32)
+
+    betas = min_rate + diffusion_times * (
+        max_rate - min_rate
+    )
+
+    alphas = 1.0 - betas
+    alpha_bars = torch.cumprod(alphas, dim=0)
+
+    signal_rates = torch.sqrt(alpha_bars)
+    noise_rates = torch.sqrt(1.0 - alpha_bars)
+
+    return noise_rates, signal_rates
+
+
+def cosine_diffusion_schedule(diffusion_times):
+    signal_rates = torch.cos(
+        diffusion_times * math.pi / 2
+    )
+
+    noise_rates = torch.sin(
+        diffusion_times * math.pi / 2
+    )
+
+    return noise_rates, signal_rates
+
+
+def offset_cosine_diffusion_schedule(
+    diffusion_times,
+    min_signal_rate=0.02,
+    max_signal_rate=0.95,
+):
+    original_shape = diffusion_times.shape
+    diffusion_times_flat = diffusion_times.flatten()
+
+    start_angle = torch.acos(
+        torch.tensor(
+            max_signal_rate,
+            dtype=torch.float32,
+            device=diffusion_times.device,
+        )
+    )
+
+    end_angle = torch.acos(
+        torch.tensor(
+            min_signal_rate,
+            dtype=torch.float32,
+            device=diffusion_times.device,
+        )
+    )
+
+    diffusion_angles = start_angle + diffusion_times_flat * (
+        end_angle - start_angle
+    )
+
+    signal_rates = torch.cos(
+        diffusion_angles
+    ).reshape(original_shape)
+
+    noise_rates = torch.sin(
+        diffusion_angles
+    ).reshape(original_shape)
+
+    return noise_rates, signal_rates
+
+
+class SinusoidalEmbedding(nn.Module):
+    def __init__(self, num_frequencies=16):
+        super().__init__()
+
+        self.num_frequencies = num_frequencies
+
+        frequencies = torch.exp(
+            torch.linspace(
+                math.log(1.0),
+                math.log(1000.0),
+                num_frequencies,
+            )
+        )
+
+        self.register_buffer(
+            "angular_speeds",
+            2.0
+            * math.pi
+            * frequencies.view(1, 1, 1, -1),
+        )
+
+    def forward(self, x):
+        x = x.expand(
+            -1,
+            1,
+            1,
+            self.num_frequencies,
+        )
+
+        sin_part = torch.sin(
+            self.angular_speeds * x
+        )
+
+        cos_part = torch.cos(
+            self.angular_speeds * x
+        )
+
+        return torch.cat(
+            [sin_part, cos_part],
+            dim=-1,
+        )
+
+class ResidualBlock(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+
+        self.batch_norm1 = nn.BatchNorm2d(in_channels)
+
+        self.conv1 = nn.Conv2d(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            kernel_size=3,
+            padding=1,
+        )
+
+        self.batch_norm2 = nn.BatchNorm2d(out_channels)
+
+        self.conv2 = nn.Conv2d(
+            in_channels=out_channels,
+            out_channels=out_channels,
+            kernel_size=3,
+            padding=1,
+        )
+
+        if in_channels == out_channels:
+            self.residual_connection = nn.Identity()
+        else:
+            self.residual_connection = nn.Conv2d(
+                in_channels=in_channels,
+                out_channels=out_channels,
+                kernel_size=1,
+            )
+
+    def forward(self, x):
+        residual = self.residual_connection(x)
+
+        x = self.batch_norm1(x)
+        x = F.silu(x)
+        x = self.conv1(x)
+
+        x = self.batch_norm2(x)
+        x = F.silu(x)
+        x = self.conv2(x)
+
+        return x + residual
+
+
+class DownBlock(nn.Module):
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        block_depth=2,
+    ):
+        super().__init__()
+
+        blocks = []
+
+        current_channels = in_channels
+
+        for _ in range(block_depth):
+            blocks.append(
+                ResidualBlock(
+                    in_channels=current_channels,
+                    out_channels=out_channels,
+                )
+            )
+
+            current_channels = out_channels
+
+        self.blocks = nn.ModuleList(blocks)
+
+        self.downsample = nn.AvgPool2d(
+            kernel_size=2,
+            stride=2,
+        )
+
+    def forward(self, x):
+        skip_connections = []
+
+        for block in self.blocks:
+            x = block(x)
+            skip_connections.append(x)
+
+        x = self.downsample(x)
+
+        return x, skip_connections
+
+class UpBlock(nn.Module):
+    def __init__(
+        self,
+        in_channels,
+        skip_channels,
+        out_channels,
+        block_depth=2,
+    ):
+        super().__init__()
+
+        self.upsample = nn.Upsample(
+            scale_factor=2,
+            mode="bilinear",
+            align_corners=False,
+        )
+
+        blocks = []
+
+        current_channels = in_channels + skip_channels
+
+        for _ in range(block_depth):
+            blocks.append(
+                ResidualBlock(
+                    in_channels=current_channels,
+                    out_channels=out_channels,
+                )
+            )
+
+            current_channels = out_channels + skip_channels
+
+        self.blocks = nn.ModuleList(blocks)
+
+    def forward(self, x, skip_connections):
+        x = self.upsample(x)
+
+        for block in self.blocks:
+            skip = skip_connections.pop()
+
+            x = torch.cat(
+                [x, skip],
+                dim=1,
+            )
+
+            x = block(x)
+
+        return x
+
+
+class UNet(nn.Module):
+    def __init__(
+        self,
+        image_size=32,
+        image_channels=3,
+        widths=(32, 64, 96),
+        block_depth=2,
+        embedding_dim=32,
+    ):
+        super().__init__()
+
+        self.image_size = image_size
+        self.image_channels = image_channels
+
+        self.noise_embedding = SinusoidalEmbedding(
+            num_frequencies=embedding_dim // 2
+        )
+
+        self.input_projection = nn.Conv2d(
+            image_channels,
+            widths[0],
+            kernel_size=1,
+        )
+
+        self.embedding_projection = nn.Conv2d(
+            embedding_dim,
+            widths[0],
+            kernel_size=1,
+        )
+
+        self.down_blocks = nn.ModuleList(
+            [
+                DownBlock(
+                    in_channels=widths[index],
+                    out_channels=widths[index + 1],
+                    block_depth=block_depth,
+                )
+                for index in range(len(widths) - 1)
+            ]
+        )
+
+        self.middle_blocks = nn.ModuleList(
+            [
+                ResidualBlock(
+                    in_channels=widths[-1],
+                    out_channels=widths[-1],
+                )
+                for _ in range(block_depth)
+            ]
+        )
+
+        self.up_blocks = nn.ModuleList(
+    [
+        UpBlock(
+            in_channels=widths[index + 1],
+            skip_channels=widths[index + 1],
+            out_channels=widths[index],
+            block_depth=block_depth,
+        )
+        for index in reversed(
+            range(len(widths) - 1)
+        )
+    ]
+)
+
+        self.output_projection = nn.Conv2d(
+            widths[0],
+            image_channels,
+            kernel_size=1,
+        )
+
+        nn.init.zeros_(self.output_projection.weight)
+        nn.init.zeros_(self.output_projection.bias)
+
+    def forward(self, noisy_images, noise_variances):
+        noise_embedding = self.noise_embedding(
+            noise_variances
+        )
+
+        noise_embedding = noise_embedding.permute(
+            0,
+            3,
+            1,
+            2,
+        )
+
+        noise_embedding = self.embedding_projection(
+            noise_embedding
+        )
+
+        noise_embedding = F.interpolate(
+            noise_embedding,
+            size=(
+                noisy_images.shape[2],
+                noisy_images.shape[3],
+            ),
+            mode="nearest",
+        )
+
+        x = self.input_projection(noisy_images)
+        x = x + noise_embedding
+
+        skip_connections = []
+
+        for down_block in self.down_blocks:
+            x, block_skips = down_block(x)
+            skip_connections.extend(block_skips)
+
+        for middle_block in self.middle_blocks:
+            x = middle_block(x)
+
+        for up_block in self.up_blocks:
+            x = up_block(x, skip_connections)
+
+        return self.output_projection(x)   
+
+class DiffusionModel(nn.Module):
+    def __init__(
+        self,
+        network,
+        schedule_fn=offset_cosine_diffusion_schedule,
+        ema_decay=0.999,
+    ):
+        super().__init__()
+
+        self.network = network
+        self.ema_network = copy.deepcopy(network)
+
+        self.ema_network.eval()
+
+        for parameter in self.ema_network.parameters():
+            parameter.requires_grad = False
+
+        self.schedule_fn = schedule_fn
+        self.ema_decay = ema_decay
+
+        self.normalizer_mean = 0.0
+        self.normalizer_std = 1.0
+
+    def set_normalizer(self, mean, std):
+        self.normalizer_mean = mean
+        self.normalizer_std = std
+
+    def normalize(self, images):
+        return (
+            images - self.normalizer_mean
+        ) / self.normalizer_std
+
+    def denormalize(self, images):
+        images = (
+            images * self.normalizer_std
+            + self.normalizer_mean
+        )
+
+        return torch.clamp(
+            images,
+            min=0.0,
+            max=1.0,
+        )
+
+    def denoise(
+        self,
+        noisy_images,
+        noise_rates,
+        signal_rates,
+        training=True,
+    ):
+        if training:
+            network = self.network
+        else:
+            network = self.ema_network
+
+        predicted_noises = network(
+            noisy_images,
+            noise_rates**2,
+        )
+
+        predicted_images = (
+            noisy_images
+            - noise_rates * predicted_noises
+        ) / signal_rates
+
+        return predicted_noises, predicted_images
+
+    def update_ema(self):
+        with torch.no_grad():
+            for ema_parameter, parameter in zip(
+                self.ema_network.parameters(),
+                self.network.parameters(),
+            ):
+                ema_parameter.mul_(self.ema_decay)
+                ema_parameter.add_(
+                    parameter,
+                    alpha=1.0 - self.ema_decay,
+                )
+
+    def train_step(
+        self,
+        images,
+        optimizer,
+        loss_fn,
+    ):
+        self.network.train()
+
+        images = self.normalize(images)
+
+        noises = torch.randn_like(images)
+
+        diffusion_times = torch.rand(
+            images.size(0),
+            1,
+            1,
+            1,
+            device=images.device,
+        )
+
+        noise_rates, signal_rates = self.schedule_fn(
+            diffusion_times
+        )
+
+        noisy_images = (
+            signal_rates * images
+            + noise_rates * noises
+        )
+
+        predicted_noises, _ = self.denoise(
+            noisy_images,
+            noise_rates,
+            signal_rates,
+            training=True,
+        )
+
+        loss = loss_fn(
+            predicted_noises,
+            noises,
+        )
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        self.update_ema()
+
+        return loss.item()
+
+    def test_step(
+        self,
+        images,
+        loss_fn,
+    ):
+        self.ema_network.eval()
+
+        images = self.normalize(images)
+
+        noises = torch.randn_like(images)
+
+        diffusion_times = torch.rand(
+            images.size(0),
+            1,
+            1,
+            1,
+            device=images.device,
+        )
+
+        noise_rates, signal_rates = self.schedule_fn(
+            diffusion_times
+        )
+
+        noisy_images = (
+            signal_rates * images
+            + noise_rates * noises
+        )
+
+        with torch.no_grad():
+            predicted_noises, _ = self.denoise(
+                noisy_images,
+                noise_rates,
+                signal_rates,
+                training=False,
+            )
+
+            loss = loss_fn(
+                predicted_noises,
+                noises,
+            )
+
+        return loss.item()
+
+    def reverse_diffusion(
+        self,
+        initial_noise,
+        diffusion_steps=20,
+    ):
+        step_size = 1.0 / diffusion_steps
+        current_images = initial_noise
+
+        predicted_images = None
+
+        for step in range(diffusion_steps):
+            diffusion_times = torch.ones(
+                initial_noise.size(0),
+                1,
+                1,
+                1,
+                device=initial_noise.device,
+            )
+
+            diffusion_times = diffusion_times * (
+                1.0 - step * step_size
+            )
+
+            noise_rates, signal_rates = self.schedule_fn(
+                diffusion_times
+            )
+
+            predicted_noises, predicted_images = (
+                self.denoise(
+                    current_images,
+                    noise_rates,
+                    signal_rates,
+                    training=False,
+                )
+            )
+
+            next_diffusion_times = torch.clamp(
+                diffusion_times - step_size,
+                min=0.0,
+            )
+
+            next_noise_rates, next_signal_rates = (
+                self.schedule_fn(
+                    next_diffusion_times
+                )
+            )
+
+            current_images = (
+                next_signal_rates * predicted_images
+                + next_noise_rates * predicted_noises
+            )
+
+        return predicted_images
+
+    def generate(
+        self,
+        num_images=16,
+        diffusion_steps=20,
+        image_size=32,
+        initial_noise=None,
+    ):
+        device = next(self.network.parameters()).device
+
+        if initial_noise is None:
+            initial_noise = torch.randn(
+                num_images,
+                self.network.image_channels,
+                image_size,
+                image_size,
+                device=device,
+            )
+
+        self.ema_network.eval()
+
+        with torch.no_grad():
+            generated_images = self.reverse_diffusion(
+                initial_noise,
+                diffusion_steps=diffusion_steps,
+            )
+
+        return self.denormalize(generated_images)
+
+    def forward(
+        self,
+        noisy_images,
+        noise_variances,
+    ):
+        return self.network(
+            noisy_images,
+            noise_variances,
+        ) 
+
+class EnergyModel(nn.Module):
+    def __init__(self, image_channels=3):
+        super().__init__()
+
+        self.conv1 = nn.Conv2d(
+            image_channels,
+            16,
+            kernel_size=5,
+            stride=2,
+            padding=2,
+        )
+
+        self.conv2 = nn.Conv2d(
+            16,
+            32,
+            kernel_size=3,
+            stride=2,
+            padding=1,
+        )
+
+        self.conv3 = nn.Conv2d(
+            32,
+            64,
+            kernel_size=3,
+            stride=2,
+            padding=1,
+        )
+
+        self.conv4 = nn.Conv2d(
+            64,
+            64,
+            kernel_size=3,
+            stride=2,
+            padding=1,
+        )
+
+        self.flatten = nn.Flatten()
+
+        self.fc1 = nn.Linear(
+            64 * 2 * 2,
+            64,
+        )
+
+        self.fc2 = nn.Linear(
+            64,
+            1,
+        )
+
+    def forward(self, x):
+        x = swish(self.conv1(x))
+        x = swish(self.conv2(x))
+        x = swish(self.conv3(x))
+        x = swish(self.conv4(x))
+
+        x = self.flatten(x)
+
+        x = swish(self.fc1(x))
+
+        return self.fc2(x)
+
 def get_model(model_name):
     if model_name == "FCNN":
         return FCNN()
@@ -399,8 +1091,28 @@ def get_model(model_name):
     if model_name == "MNISTGAN":
         return MNISTGAN()
 
+    if model_name == "Diffusion":
+        unet = UNet(
+            image_size=32,
+            image_channels=3,
+            widths=(32, 64, 96),
+            block_depth=2,
+            embedding_dim=32,
+        )
+
+        return DiffusionModel(
+            network=unet,
+            schedule_fn=offset_cosine_diffusion_schedule,
+        )
+
+    if model_name == "Energy":
+        return EnergyModel(
+            image_channels=3,
+        )
+
     raise ValueError(
-    "model_name must be 'FCNN', 'CNN', 'EnhancedCNN', 'VAE', "
-    "'AssignmentCNN', 'Generator', 'Critic', 'GAN', "
-    "'MNISTGenerator', 'MNISTDiscriminator', or 'MNISTGAN'"
+        "model_name must be 'FCNN', 'CNN', 'EnhancedCNN', 'VAE', "
+        "'AssignmentCNN', 'Generator', 'Critic', 'GAN', "
+        "'MNISTGenerator', 'MNISTDiscriminator', 'MNISTGAN', "
+        "'Diffusion', or 'Energy'"
     )
