@@ -34,10 +34,7 @@ def main():
         transform=transform,
     )
 
-    train_dataset = torch.utils.data.Subset(
-    train_dataset,
-    range(256),
-)
+
 
     train_loader = DataLoader(
         train_dataset,
