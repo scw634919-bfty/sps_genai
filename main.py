@@ -12,8 +12,60 @@ from app.bigram_model import BigramModel
 from app.embedding_model import EmbeddingModel
 from helper_lib.model import get_model
 from helper_lib.generator import generate_energy_samples
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 app = FastAPI()
+
+# Assignment 5 RL model
+assignment5_device = (
+    "cuda"
+    if torch.cuda.is_available()
+    else "mps"
+    if torch.backends.mps.is_available()
+    else "cpu"
+)
+
+assignment5_checkpoint = "checkpoints/assignment5_rl"
+
+assignment5_tokenizer = AutoTokenizer.from_pretrained(
+    assignment5_checkpoint
+)
+
+assignment5_model = AutoModelForCausalLM.from_pretrained(
+    assignment5_checkpoint
+).to(assignment5_device)
+
+assignment5_model.eval()
+
+ASSIGNMENT5_FORMAT_LABELS = ["A", "B", "C"]
+
+ASSIGNMENT5_FORMATS = {
+    "A": {
+        "start": "That is a great question. ",
+        "end": " Let me know if you have any other questions.",
+    },
+    "B": {
+        "start": "Here is the answer. ",
+        "end": "",
+    },
+    "C": {
+        "start": "",
+        "end": " Hope this helps.",
+    },
+}
+
+assignment5_action_texts = [" A", " B", " C"]
+
+assignment5_action_token_ids = torch.tensor(
+    [
+        assignment5_tokenizer.encode(
+            action_text,
+            add_special_tokens=False,
+        )[0]
+        for action_text in assignment5_action_texts
+    ],
+    device=assignment5_device,
+)
 
 # Sample corpus for the bigram model
 corpus = [
@@ -293,3 +345,85 @@ def generate_energy():
     )
 
     return rgb_tensor_to_response(images[0])
+
+@app.get("/generate-rl")
+def generate_rl(question: str = "What is machine learning?"):
+    # Step 1: Generate the answer content
+    answer_prompt = f"Question: {question}\nAnswer:"
+
+    answer_inputs = assignment5_tokenizer(
+        answer_prompt,
+        return_tensors="pt",
+    ).to(assignment5_device)
+
+    with torch.no_grad():
+        generated_ids = assignment5_model.generate(
+            **answer_inputs,
+            max_new_tokens=30,
+            do_sample=True,
+            top_k=40,
+            temperature=0.8,
+            pad_token_id=assignment5_tokenizer.eos_token_id,
+        )
+
+    generated_text = assignment5_tokenizer.decode(
+        generated_ids[
+            0,
+            answer_inputs["input_ids"].shape[1]:
+        ],
+        skip_special_tokens=True,
+    ).strip()
+
+    # Step 2: Ask the RL post-trained model which format to use
+    format_prompt = (
+        f"Question: {question}\n"
+        f"Choose response format:"
+    )
+
+    format_inputs = assignment5_tokenizer(
+        format_prompt,
+        return_tensors="pt",
+    ).to(assignment5_device)
+
+    with torch.no_grad():
+        format_outputs = assignment5_model(
+            **format_inputs
+        )
+
+    logits = format_outputs.logits[
+        0,
+        -1,
+        assignment5_action_token_ids,
+    ]
+
+    probabilities = torch.softmax(
+        logits,
+        dim=-1,
+    )
+
+    best_index = torch.argmax(
+        probabilities
+    ).item()
+
+    selected_format = ASSIGNMENT5_FORMAT_LABELS[
+        best_index
+    ]
+
+    # Step 3: Apply the selected response format
+    response = (
+        ASSIGNMENT5_FORMATS[selected_format]["start"]
+        + generated_text
+        + ASSIGNMENT5_FORMATS[selected_format]["end"]
+    )
+
+    return {
+        "question": question,
+        "response": response,
+        "selected_format": selected_format,
+        "format_success": selected_format == "A",
+        "probabilities": {
+            "A": probabilities[0].item(),
+            "B": probabilities[1].item(),
+            "C": probabilities[2].item(),
+        },
+    }
